@@ -1290,8 +1290,9 @@ public class ImapConnection extends AbstractConnection {
 
     protected void appendEnvelopeHeaderValue(StringBuilder buffer, String value) throws UnsupportedEncodingException {
         if (value.indexOf('"') >= 0 || value.indexOf('\\') >= 0) {
+            byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             buffer.append('{');
-            buffer.append(value.length());
+            buffer.append(bytes.length);
             buffer.append("}\r\n");
             buffer.append(value);
         } else {
@@ -1305,6 +1306,13 @@ public class ImapConnection extends AbstractConnection {
     protected void appendBodyStructure(StringBuilder buffer, MessageWrapper message) throws IOException {
 
         buffer.append(" BODYSTRUCTURE ");
+        int threshold = 5 * 1024 * 1024;
+        if (message.message.size > threshold) {
+            //too large; send fake bodystructure
+            buffer.append("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" ");
+            buffer.append(message.message.size).append(" 0 NIL NIL NIL NIL)");
+            return;
+        }
         try {
             MimeMessage mimeMessage = message.getMimeMessage();
             Object mimeBody = mimeMessage.getContent();
@@ -1326,6 +1334,7 @@ public class ImapConnection extends AbstractConnection {
 
         for (int i = 0; i < multiPart.getCount(); i++) {
             MimeBodyPart bodyPart = (MimeBodyPart) multiPart.getBodyPart(i);
+            if (i > 0) { buffer.append(' '); }
             try {
                 Object mimeBody = bodyPart.getContent();
                 if (mimeBody instanceof MimeMultipart) {
@@ -1359,22 +1368,44 @@ public class ImapConnection extends AbstractConnection {
     protected void appendBodyStructure(StringBuilder buffer, MimePart bodyPart) throws IOException, MessagingException {
         String contentType = MimeUtility.unfold(bodyPart.getContentType());
         int slashIndex = contentType.indexOf('/');
-        if (slashIndex < 0) {
-            throw new DavMailException("EXCEPTION_INVALID_CONTENT_TYPE", contentType);
-        }
-        String type = contentType.substring(0, slashIndex).toUpperCase();
-        buffer.append("(\"").append(type).append("\" \"");
         int semiColonIndex = contentType.indexOf(';');
+        String type;
+        String subType;
+
+        if (slashIndex < 0) {
+            int baseEnd = (semiColonIndex < 0) ? contentType.length() : semiColonIndex;
+            String rawType = contentType.substring(0, baseEnd).trim();
+            if (rawType.isEmpty()) {
+                rawType = "application";
+            }
+            type = rawType.toUpperCase();
+            // safe defaults for missing subtype
+            if ("TEXT".equals(type)) {
+                subType = "PLAIN";
+            } else if ("MULTIPART".equals(type)) {
+                subType = "MIXED";
+            } else {
+                // application, image, audio, etc.
+                subType = "OCTET-STREAM";
+            }
+        } else {
+            type = contentType.substring(0, slashIndex).toUpperCase();
+            if (semiColonIndex < 0) {
+                // handle malformed subtype strings that takc parameters without a ';'
+                subType = contentType.substring(slashIndex + 1).trim().split("\\s+|(?i)name=", 2)[0].toUpperCase();
+            } else {
+                subType = contentType.substring(slashIndex + 1, semiColonIndex).trim().toUpperCase();
+            }
+        }
+        buffer.append("(\"").append(type).append("\" \"").append(subType).append('\"');
         if (semiColonIndex < 0) {
-            buffer.append(contentType.substring(slashIndex + 1).toUpperCase()).append("\" NIL");
+            buffer.append(" NIL");
         } else {
             // extended content type
-            buffer.append(contentType.substring(slashIndex + 1, semiColonIndex).trim().toUpperCase()).append('\"');
             int charsetindex = contentType.indexOf("charset=");
             int nameindex = contentType.indexOf("name=");
             if (charsetindex >= 0 || nameindex >= 0) {
                 buffer.append(" (");
-
                 if (charsetindex >= 0) {
                     buffer.append("\"CHARSET\" ");
                     int charsetSemiColonIndex = contentType.indexOf(';', charsetindex);
@@ -1384,21 +1415,14 @@ public class ImapConnection extends AbstractConnection {
                     } else {
                         charsetEndIndex = contentType.length();
                     }
-                    String charSet = contentType.substring(charsetindex + "charset=".length(), charsetEndIndex);
-                    if (!charSet.startsWith("\"")) {
-                        buffer.append('"');
-                    }
-                    buffer.append(charSet.trim().toUpperCase());
-                    if (!charSet.endsWith("\"")) {
-                        buffer.append('"');
-                    }
+                    String charset = contentType.substring(charsetindex + "charset=".length(), charsetEndIndex);
+                    charset = stripOuterQuotes(charset).toUpperCase();
+                    appendNString(buffer, charset);
                 }
-
                 if (nameindex >= 0) {
                     if (charsetindex >= 0) {
                         buffer.append(' ');
                     }
-
                     buffer.append("\"NAME\" ");
                     int nameSemiColonIndex = contentType.indexOf(';', nameindex);
                     int nameEndIndex;
@@ -1408,24 +1432,20 @@ public class ImapConnection extends AbstractConnection {
                         nameEndIndex = contentType.length();
                     }
                     String name = contentType.substring(nameindex + "name=".length(), nameEndIndex).trim();
-                    if (!name.startsWith("\"")) {
-                        buffer.append('"');
-                    }
-                    buffer.append(name.trim());
-                    if (!name.endsWith("\"")) {
-                        buffer.append('"');
-                    }
+                    name = stripOuterQuotes(name).toUpperCase();
+                    appendNString(buffer, name);
                 }
                 buffer.append(')');
             } else {
                 buffer.append(" NIL");
             }
         }
+
         int bodySize = getBodyPartSize(bodyPart);
         appendBodyStructureValue(buffer, bodyPart.getContentID());
         appendBodyStructureValue(buffer, bodyPart.getDescription());
         appendBodyStructureValue(buffer, bodyPart.getEncoding());
-        appendBodyStructureValue(buffer, bodySize);
+        appendBodyStructureValue(buffer, bodySize);  
 
         // line count not implemented in JavaMail, return fake line count
         int lineCount = bodySize / 80;
@@ -1435,7 +1455,9 @@ public class ImapConnection extends AbstractConnection {
             Object bodyPartContent = bodyPart.getContent();
             if (bodyPartContent instanceof MimeMessage) {
                 MimeMessage innerMessage = (MimeMessage) bodyPartContent;
+                buffer.append(' '); // space required for grammar
                 appendEnvelope(buffer, innerMessage);
+                buffer.append(' ');
                 appendBodyStructure(buffer, innerMessage);
                 appendBodyStructureValue(buffer, lineCount);
             } else {
@@ -1444,6 +1466,39 @@ public class ImapConnection extends AbstractConnection {
             }
         }
         buffer.append(')');
+    }
+
+    // helper functions related to above
+    private static String stripOuterQuotes(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.length() >= 2 && t.startsWith("\"") && t.endsWith("\"")) {
+            return t.substring(1, t.length() - 1);
+        }
+        return t;
+    }
+
+    private static void appendNString(StringBuilder buffer, String value) {
+        if (value == null) {
+            buffer.append("NIL");
+            return;
+        }
+        if (needsImapLiteral(value)) {
+            byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            buffer.append('{').append(bytes.length).append("}\r\n").append(value);
+        } else {
+            buffer.append('"').append(value).append('"');
+        }
+    }
+
+    private static boolean needsImapLiteral(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            // IMAP quoted-string cannot contain CTLs (0x00-0x1F, 0x7F) nor unescaped " or \
+            if (c <= 0x1F || c == 0x7F || c == '"' || c == '\\') return true;
+        }
+        return false;
     }
 
     /**
