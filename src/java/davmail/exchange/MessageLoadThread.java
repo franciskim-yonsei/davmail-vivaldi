@@ -56,7 +56,7 @@ public class MessageLoadThread extends Thread {
                 messageLoadThread.start();
                 while (!messageLoadThread.isComplete) {
                     try {
-                        messageLoadThread.join(10000);
+                        messageLoadThread.join(3000);
                     } catch (InterruptedException e) {
                         LOGGER.warn("Thread interrupted", e);
                         Thread.currentThread().interrupt();
@@ -82,4 +82,5 @@ public class MessageLoadThread extends Thread {
                 }
         }
     }
+
 }
